@@ -1,13 +1,46 @@
 # Copyright 2026 Tencent.
+import os
 from collections.abc import Iterable
 
 import torch
 from torch import nn
 from transformers.models.whisper.modeling_whisper import WhisperEncoder
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import AutoWeightsLoader, init_vllm_registered_model, maybe_prefix
 from vllm.sequence import IntermediateTensors
+
+from vllm_omni.model_executor.bucketed_encoder import (
+    BucketedCUDAGraphRunner,
+    parse_seconds_ladder,
+)
+
+logger = init_logger(__name__)
+
+# Whisper mel hop length in samples (WhisperFeatureExtractor default). Bucketed
+# waveform rungs (in samples) map to mel frames by integer division.
+_WHISPER_HOP_LENGTH = 160
+# Env switch for the bucketed encoder path. Unset -> legacy pad-to-30s eager
+# path (unchanged behaviour). Set e.g. "0.5,1,2,4,8,16,30" to enable
+# length-bucketed padding + bucketed CUDA graphs for the Whisper encoder.
+_COVO_AUDIO_BUCKET_SECONDS_ENV = "COVO_AUDIO_BUCKET_SECONDS"
+# Large-batch graphs are only captured for short audio (activation ~ bs*T).
+_LARGE_CAPTURE_LENGTH_MAX = (8 * 16000) // _WHISPER_HOP_LENGTH  # 8 s -> 800 frames
+
+
+def _parse_bucketed_ladder():
+    """Read the deploy-time bucket ladder, or ``None`` to keep the legacy path."""
+    raw = os.environ.get(_COVO_AUDIO_BUCKET_SECONDS_ENV, "").strip()
+    if not raw:
+        return None
+    return parse_seconds_ladder(
+        raw,
+        sample_rate=16000,
+        default_seconds=(),
+        min_seconds=0.5,
+        max_seconds=30.0,
+    )
 
 
 class DownsampleLayer(nn.Module):
@@ -92,6 +125,12 @@ class CovoAudioLLMForConditionalGeneration(nn.Module, SupportsPP, SupportsMultiM
         )
         self.make_empty_intermediate_tensors = self.llm.make_empty_intermediate_tensors
 
+        # Bucketed encoder path (deploy-tunable via env var). The ladder is
+        # parsed eagerly (fail fast); the CUDA graphs are captured lazily after
+        # weights are loaded, when dtype/device are final.
+        self._bucketed_ladder = _parse_bucketed_ladder()
+        self._bucketed_runner: BucketedCUDAGraphRunner | None = None
+
     def get_language_model(self) -> torch.nn.Module:
         return self.llm
 
@@ -107,11 +146,95 @@ class CovoAudioLLMForConditionalGeneration(nn.Module, SupportsPP, SupportsMultiM
             is_multimodal=is_multimodal,
         )
 
+    def _encode(self, audio_features: torch.Tensor) -> torch.Tensor:
+        """Whisper encoder + audio adapter as one graph-capturable forward."""
+        feats = self.encoder(audio_features).last_hidden_state
+        return self.audio_adapter(feats)
+
+    def _capture_bucketed_graphs(self) -> None:
+        """Capture one graph per ``(batch, mel-frames bucket)`` into a shared pool.
+
+        Called from ``load_weights`` once dtype/device are final. A capture
+        failure falls back to eager rather than crashing the worker.
+        """
+        if self._bucketed_ladder is None or self._bucketed_runner is not None:
+            return
+        try:
+            device = next(self.encoder.parameters()).device
+            dtype = next(self.encoder.parameters()).dtype
+            n_mels = self.encoder.conv1.weight.shape[1]
+            length_buckets = sorted({s // _WHISPER_HOP_LENGTH for s in self._bucketed_ladder.buckets})
+
+            def make_inputs(batch: int, length: int) -> tuple[torch.Tensor, ...]:
+                return (torch.zeros(batch, length, n_mels, dtype=dtype, device=device),)
+
+            self._bucketed_runner = BucketedCUDAGraphRunner(
+                self._encode,
+                length_buckets=length_buckets,
+                make_inputs=make_inputs,
+                capture_sizes=(1, 2, 4, 8),
+                large_capture_sizes=(16, 32),
+                large_length_max=_LARGE_CAPTURE_LENGTH_MAX,
+                eager_chunk=8,
+            )
+            logger.info("Captured bucketed CUDA graphs for CovoAudio Whisper encoder (frames %s)", length_buckets)
+        except Exception:
+            logger.warning("Failed to capture bucketed CUDA graphs; falling back to eager", exc_info=True)
+            self._bucketed_runner = None
+
+    def _embed_bucketed(
+        self,
+        audio_features: object,
+        audio_num_tokens: object,
+        encoder_dtype: torch.dtype,
+    ) -> list[torch.Tensor]:
+        """Group same-bucket items and run each group through the bucketed graphs.
+
+        ``audio_features`` is either a homogeneous ``(B, T, n_mels)`` tensor or
+        a list of per-item ``(T_i, n_mels)`` tensors (mixed-bucket batches).
+        Each group is encoded with the matching ``(batch, T)`` graph, then rows
+        are trimmed to their real token counts.
+        """
+        if isinstance(audio_features, (list, tuple)):
+            items = [torch.as_tensor(f, dtype=encoder_dtype) for f in audio_features]
+        else:
+            items = [audio_features[i].to(dtype=encoder_dtype) for i in range(audio_features.size(0))]
+
+        lengths = [int(t) for t in audio_num_tokens] if audio_num_tokens is not None else None
+        rows: list[torch.Tensor | None] = [None] * len(items)
+
+        by_t: dict[int, list[int]] = {}
+        for i, item in enumerate(items):
+            by_t.setdefault(int(item.size(-2)), []).append(i)
+
+        # Graph replay when captured, otherwise eager on the same groups (a
+        # capture failure must not take down the worker or the bucketed
+        # padding win).
+        encode = self._bucketed_runner.execute if self._bucketed_runner is not None else self._encode
+
+        for indices in by_t.values():
+            feats_g = torch.stack([items[i] for i in indices], dim=0)
+            emb_g = encode(feats_g)
+            emb_g = emb_g[0] if self._bucketed_runner is not None else emb_g
+            for j, i in enumerate(indices):
+                if lengths is not None:
+                    rows[i] = emb_g[j, :lengths[i]].clone()
+                else:
+                    rows[i] = emb_g[j].clone()
+
+        assert all(r is not None for r in rows)
+        return rows
+
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         audio_features = kwargs["audio_features"]
         audio_num_tokens = kwargs.get("audio_num_tokens")
         # Match encoder dtype (bfloat16) since audio_features from WhisperFeatureExtractor are float32
         encoder_dtype = next(self.encoder.parameters()).dtype
+
+        if self._bucketed_ladder is not None:
+            return self._embed_bucketed(audio_features, audio_num_tokens, encoder_dtype)
+
+        # Legacy path: pad-to-30s eager encode (unchanged behaviour).
         audio_features = audio_features.to(dtype=encoder_dtype)
         feats = self.encoder(audio_features).last_hidden_state
         features = self.audio_adapter(feats)
@@ -149,4 +272,7 @@ class CovoAudioLLMForConditionalGeneration(nn.Module, SupportsPP, SupportsMultiM
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        # Capture bucketed CUDA graphs only after weights (dtype/device) are final.
+        self._capture_bucketed_graphs()
+        return loaded

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Copyright 2026 Tencent.
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -28,12 +29,32 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+from vllm_omni.model_executor.bucketed_encoder import parse_seconds_ladder
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
 
 # Max tokens per audio: Whisper 30s → 3000 mel frames → encoder 2x + adapter 8x = 16x → 188
 MAX_AUDIO_TOKENS = 188
+
+# Deploy-tunable bucket ladder for audio padding. Unset -> legacy pad-to-30s.
+# MUST stay in sync with _parse_bucketed_ladder in covo_audio_llm.py: both read
+# this env var and use the same parse_seconds_ladder arguments.
+_COVO_AUDIO_BUCKET_SECONDS_ENV = "COVO_AUDIO_BUCKET_SECONDS"
+
+
+def _covo_bucketed_ladder():
+    """Read the deploy-time bucket ladder, or ``None`` to keep the legacy path."""
+    raw = os.environ.get(_COVO_AUDIO_BUCKET_SECONDS_ENV, "").strip()
+    if not raw:
+        return None
+    return parse_seconds_ladder(
+        raw,
+        sample_rate=16000,
+        default_seconds=(),
+        min_seconds=0.5,
+        max_seconds=30.0,
+    )
 
 
 def _calc_audio_num_tokens(num_samples: int, sample_rate: int) -> int:
@@ -122,16 +143,34 @@ class CovoAudioMultiModalProcessor(OmniMultiModalProcessor[CovoAudioProcessingIn
             # compute token count at 16 kHz regardless of the original sr.
             num_tokens_list.append(_calc_audio_num_tokens(len(audio_array), 16000))
 
-        features = feature_extractor(
-            raw_audios,
-            sampling_rate=16000,
-            return_tensors="pt",
-        )
+        ladder = _covo_bucketed_ladder()
+        if ladder is None:
+            features = feature_extractor(
+                raw_audios,
+                sampling_rate=16000,
+                return_tensors="pt",
+            )
+            audio_features = features["input_features"]
+        else:
+            # Bucketed padding: pad each audio to the smallest ladder rung >=
+            # its length instead of the shared 30 s max. Variable-length mel
+            # outputs make vLLM pass `audio_features` through as a list of
+            # per-item `(T_i, n_mels)` tensors (see embed_multimodal).
+            audio_features = []
+            for audio_array in raw_audios:
+                bucket_samples = ladder.padded_length(len(audio_array))
+                feats = feature_extractor(
+                    [audio_array],
+                    sampling_rate=16000,
+                    return_tensors="pt",
+                    max_length=bucket_samples,
+                )
+                audio_features.append(feats["input_features"][0])
 
         return BatchFeature(
             data={
                 "input_ids": torch.tensor([prompt_ids], dtype=torch.int64),
-                "audio_features": features["input_features"],
+                "audio_features": audio_features,
                 "audio_num_tokens": torch.tensor(num_tokens_list, dtype=torch.int64),
             },
             tensor_type=None,

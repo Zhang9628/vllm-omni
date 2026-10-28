@@ -170,9 +170,31 @@ community-reproducible.
 A reproducible vLLM-Omni benchmark on public models with variable-length
 encoder stages is planned as the next step.
 
+## Reference integration: CovoAudio
+
+`CovoAudioLLMForConditionalGeneration` (Tencent Covo-Audio, a public
+speech-dialogue model) is wired as the reference integration. Its Whisper
+encoder pads every utterance to a fixed 30 s, so a 1 s utterance pays 30 s of
+encoder compute — the exact waste bucketing removes.
+
+- **Processor** (`covo_audio.py`): when `COVO_AUDIO_BUCKET_SECONDS` is set, each
+  audio is padded to the smallest ladder rung via
+  `parse_seconds_ladder(...).padded_length(...)` and featurized individually,
+  producing variable-length `(T_i, n_mels)` tensors; unset, the legacy
+  pad-to-30s path is unchanged.
+- **Model** (`covo_audio_llm.py`): after weights load, one
+  `BucketedCUDAGraphRunner` captures a graph per `(batch, mel-frame rung)` over
+  the `WhisperEncoder -> AudioAdapter` forward; `embed_multimodal` groups a
+  mixed-bucket batch by rung and dispatches by lookup, trimming each row to its
+  real token count. A capture failure falls back to eager on the same groups.
+
+Both sides read the same env var, so the deploy ladder can never drift between
+processor and encoder. This integration is the template other variable-length
+encoders follow.
+
 ## Contribution path
 
 1. Land this module and its tests (this change).
 2. Agree on the public API (the two hooks: `make_inputs` + `length_buckets`).
-3. Wire one public model with a variable-length encoder to it and publish the
-   benchmark numbers above.
+3. Land the CovoAudio reference integration and publish the vLLM-Omni
+   benchmark numbers above on public audio/speech models.
