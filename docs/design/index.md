@@ -87,6 +87,7 @@ The design contracts separate selection mechanics from backend algorithms:
 
 - [Prometheus Metrics](metrics.md)
 - [Speech Generation Performance Optimizations](qwen3_omni_tts_performance_optimization.md)
+- [Length-bucketing + CUDA graph pooling for variable-length encoders](feature/encoder_bucketing_cuda_graph_pool.md)
 
 ## Module Design Documents
 
