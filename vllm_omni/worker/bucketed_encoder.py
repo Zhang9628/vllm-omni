@@ -22,7 +22,6 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 import regex as re
-
 import torch
 from torch import nn
 from vllm.logger import init_logger
