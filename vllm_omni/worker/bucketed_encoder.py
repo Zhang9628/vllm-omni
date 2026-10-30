@@ -444,11 +444,10 @@ def _frames_from_mm_items(mm_items) -> list[int] | None:
     return frames
 
 
-def _wrap_embed_multimodal(model: nn.Module) -> None:
+def _wrap_embed_multimodal(model: nn.Module, encoders: Sequence[_BucketedEncoder]) -> None:
     original = getattr(model, "embed_multimodal", None)
     if original is None:
         return
-    encoders = [module for _, module in model.named_modules() if isinstance(module, _BucketedEncoder)]
 
     def embed_multimodal(**kwargs):
         frames = kwargs.get(_BUCKET_FRAMES_KEY)
@@ -472,18 +471,21 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
     ladder = LengthBucketingConfig(buckets=rungs, max_length=max(rungs))
     pattern = re.compile(_MODULE_PATTERN)
     wrapped: list[str] = []
+    encoders: list[_BucketedEncoder] = []
     for name, module in model.named_modules():
         if not pattern.search(name):
             continue
-        module.forward = _BucketedEncoder(module, name, ladder)
+        encoder = _BucketedEncoder(module, name, ladder)
+        module.forward = encoder
         wrapped.append(name)
+        encoders.append(encoder)
 
     if not wrapped:
         logger.warning("Bucketed encoder enabled but no encoder matched %r", _MODULE_PATTERN)
         return []
 
     _install_processor_hook()
-    _wrap_embed_multimodal(model)
+    _wrap_embed_multimodal(model, encoders)
     model._bucketed_installed = True
     logger.info("Bucketed encoder enabled over rungs %s for modules %s", rungs, wrapped)
     return wrapped
