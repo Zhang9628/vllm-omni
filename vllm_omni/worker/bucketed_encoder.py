@@ -37,6 +37,7 @@ __all__ = [
 _ENV_SECONDS = "VLLM_OMNI_AUDIO_BUCKET_SECONDS"
 _ENV_BATCH_SIZES = "VLLM_OMNI_AUDIO_BUCKET_BATCH_SIZES"
 _ENV_MAX_SECONDS = "VLLM_OMNI_AUDIO_BUCKET_MAX_SECONDS"
+_ENV_MODULES = "VLLM_OMNI_AUDIO_BUCKET_MODULES"
 _FRAMES_PER_SECOND = 100  # 10 ms mel hop; seconds ladder -> frames
 _MODULE_PATTERN = r"(?:^|\.)(?:encoder|audio_encoder|speech_encoder|audio_tower|whisper_encoder)$"
 _BUCKET_FRAMES_KEY = "encoder_bucket_frames"
@@ -250,6 +251,11 @@ class _BucketedEncoder:
                 split = _split_output(output)
                 if split is None:
                     self._disabled = True
+                    logger.warning(
+                        "Bucketed encoder %r disabled: unsupported output type %r",
+                        self.name,
+                        type(output).__name__,
+                    )
                     return output
                 self._rebuild = split[1]
                 self._ratio = split[0].size(1) / features.size(1)
@@ -263,6 +269,7 @@ class _BucketedEncoder:
             return self._original(*args, **kwargs)
 
     def _host_lengths(self, features, extra):
+        mask = None
         if extra and torch.is_tensor(extra[0]):
             second = extra[0]
             if second.dim() == 1:
@@ -271,12 +278,15 @@ class _BucketedEncoder:
                 return None, None, None
             if second.dim() == 2:
                 # A padding mask is an input, never a length source (its values
-                # live on the device and must not be read back).
-                return None, second, None
+                # live on the device and must not be read back). Published host
+                # lengths still apply alongside the mask, for call sites that
+                # pass (features, mask) positionally and rely on the
+                # embed_multimodal publish for lengths.
+                mask = second
         published = self._lengths
         if published is not None and len(published) == features.size(0):
-            return [int(v) for v in published], None, None
-        return None, None, None
+            return [int(v) for v in published], mask, None
+        return None, mask, None
 
     def _bucketed(self, features, lengths, mask, length_arg):
         groups: dict[int, list[int]] = {}
@@ -469,7 +479,8 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
         return []
 
     ladder = LengthBucketingConfig(buckets=rungs, max_length=max(rungs))
-    pattern = re.compile(_MODULE_PATTERN)
+    pattern_src = os.environ.get(_ENV_MODULES, "").strip() or _MODULE_PATTERN
+    pattern = re.compile(pattern_src)
     wrapped: list[str] = []
     encoders: list[_BucketedEncoder] = []
     for name, module in model.named_modules():
@@ -481,7 +492,7 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
         encoders.append(encoder)
 
     if not wrapped:
-        logger.warning("Bucketed encoder enabled but no encoder matched %r", _MODULE_PATTERN)
+        logger.warning("Bucketed encoder enabled but no encoder matched %r", pattern_src)
         return []
 
     _install_processor_hook()
