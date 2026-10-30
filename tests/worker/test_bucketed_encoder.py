@@ -294,8 +294,14 @@ def test_fixed_window_encoder_contract_engages(bucket_env, monkeypatch):
     class CovoContractModel(nn.Module):
         def __init__(self):
             super().__init__()
-            cfg = WhisperConfig(d_model=64, encoder_layers=1, encoder_attention_heads=2,
-                                encoder_ffn_dim=128, num_mel_bins=80, max_source_positions=1500)
+            cfg = WhisperConfig(
+                d_model=64,
+                encoder_layers=1,
+                encoder_attention_heads=2,
+                encoder_ffn_dim=128,
+                num_mel_bins=80,
+                max_source_positions=1500,
+            )
             self.encoder = WhisperEncoder(cfg).cuda().eval()
 
         def embed_multimodal(self, **kwargs):  # covo_audio_llm.py:116 contract
