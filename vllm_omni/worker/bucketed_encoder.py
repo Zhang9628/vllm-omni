@@ -12,6 +12,14 @@ graph per ``(batch, rung)`` pair from a single shared memory pool.
 No model code is required. Lengths are always host values (the processor records
 them from the raw waveforms), so the feature never reads a device value back and
 never introduces a stream sync.
+
+Scope. This is for encoder call sites that feed one globally padded batch —
+inputs carried at a non-true (batch/global padded) length, so every item is
+computed over the padded length regardless of how short its real content is.
+The wrapper re-groups items by their published true lengths and computes per
+length-rung windows instead, so short items stop paying for long ones. Call
+sites that already feed true-length or length-packed inputs have no padding
+waste to recover and should stay on the original forward.
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ _ENV_SECONDS = "VLLM_OMNI_AUDIO_BUCKET_SECONDS"
 _ENV_BATCH_SIZES = "VLLM_OMNI_AUDIO_BUCKET_BATCH_SIZES"
 _ENV_MAX_SECONDS = "VLLM_OMNI_AUDIO_BUCKET_MAX_SECONDS"
 _ENV_MODULES = "VLLM_OMNI_AUDIO_BUCKET_MODULES"
+_ENV_TIME_AXIS = "VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS"
 _FRAMES_PER_SECOND = 100  # 10 ms mel hop; seconds ladder -> frames
 _MODULE_PATTERN = r"(?:^|\.)(?:encoder|audio_encoder|speech_encoder|audio_tower|whisper_encoder)$"
 _BUCKET_FRAMES_KEY = "encoder_bucket_frames"
@@ -58,6 +67,45 @@ def _capture_sizes_from_env() -> tuple[int, ...]:
 def _max_batch_length_from_env() -> int:
     seconds = float(os.environ.get(_ENV_MAX_SECONDS, str(_MAX_BATCH_SECONDS)))
     return int(seconds * _FRAMES_PER_SECOND)
+
+
+# ----------------------------------------------------- fixed-length shims
+#
+# Some encoders pin their window length inside forward (an assertion plus a
+# fixed positional-embedding shape), so a shorter rung window is rejected even
+# though the math is well defined for variable lengths. For known classes the
+# library carries a variable-length forward recipe built from the module's own
+# submodules/weights — inference-only, no model code changes required.
+
+
+@dataclasses.dataclass
+class _ShimOutput:
+    last_hidden_state: torch.Tensor
+
+
+def _whisper_varlen_shim(module, input_features, *rest, **kwargs):
+    """HF WhisperEncoder/Qwen2AudioEncoder compute without the fixed-length
+    assumptions. Input stays in the module's native (B, mel, T) layout."""
+    x = torch.nn.functional.gelu(module.conv1(input_features))
+    x = torch.nn.functional.gelu(module.conv2(x)).permute(0, 2, 1)
+    x = x + module.embed_positions.weight[: x.size(1)]
+    for layer in module.layers:
+        out = layer(x, None)
+        x = out[0] if isinstance(out, tuple) else out
+    hidden = module.layer_norm(x)
+    try:
+        from transformers.modeling_outputs import BaseModelOutput
+
+        return BaseModelOutput(last_hidden_state=hidden)
+    except Exception:
+        return _ShimOutput(last_hidden_state=hidden)
+
+
+# Class-name keyed to avoid importing model libraries at module import.
+_FORWARD_SHIMS = {
+    "WhisperEncoder": _whisper_varlen_shim,
+    "Qwen2AudioEncoder": _whisper_varlen_shim,
+}
 
 
 # --------------------------------------------------------------------- ladder
@@ -179,8 +227,8 @@ class BucketedGraphPool:
             self.length_buckets,
         )
 
-    def execute(self, *inputs: torch.Tensor) -> torch.Tensor | None:
-        entry = self.entries.get((inputs[0].size(0), inputs[0].size(1)))
+    def execute(self, *inputs: torch.Tensor, key: tuple[int, int] | None = None) -> torch.Tensor | None:
+        entry = self.entries.get(key or (inputs[0].size(0), inputs[0].size(1)))
         if entry is None:
             return None
         if any(a.shape != b.shape for a, b in zip(entry.inputs, inputs)):
@@ -220,9 +268,25 @@ class _BucketedEncoder:
         self._ratio: float | None = None
         self._lengths: tuple[int, ...] | None = None
         self._disabled = False
+        self._axis = 1  # feature-time axis; 2 for (B, mel, T) layouts
 
     def publish(self, lengths: tuple[int, ...]) -> None:
         self._lengths = lengths
+
+    def _resolve_time_axis(self, features, lengths) -> int:
+        """1 = time on dim 1 (B, T, D); 2 = time on dim 2 (B, mel, T).
+        Explicit env wins; "auto" infers from the length scale."""
+        spec = os.environ.get(_ENV_TIME_AXIS, "auto").strip().lower()
+        if spec in ("1", "2"):
+            return int(spec)
+        time_on_1, time_on_2 = features.size(1), features.size(2)
+        longest = max(lengths)
+        if longest > time_on_1 and time_on_2 >= longest:
+            return 2
+        return 1
+
+    def _time_dim(self, features) -> int:
+        return features.size(1) if self._axis == 1 else features.size(2)
 
     def __call__(self, *args, **kwargs):
         if self._disabled or kwargs or not args:
@@ -242,6 +306,8 @@ class _BucketedEncoder:
         if lengths is None or len(lengths) != features.size(0):
             return self._original(*args, **kwargs)
 
+        self._axis = self._resolve_time_axis(features, lengths)
+
         try:
             if self._rebuild is None:
                 # First eligible call: serve it eagerly (also learning how to
@@ -258,7 +324,7 @@ class _BucketedEncoder:
                     )
                     return output
                 self._rebuild = split[1]
-                self._ratio = split[0].size(1) / features.size(1)
+                self._ratio = split[0].size(1) / self._time_dim(features)
                 self._capture(features, mask, length_arg)
                 return output
             container = self._bucketed(features, lengths, mask, length_arg)
@@ -322,7 +388,7 @@ class _BucketedEncoder:
         padded = pool.pad_batch(len(chunk)) if pool is not None else len(chunk)
         inputs = self._build_inputs(features, lengths, mask, length_arg, rung, chunk, padded)
         if pool is not None:
-            hidden = pool.execute(*inputs)
+            hidden = pool.execute(*inputs, key=(padded, rung))
             if hidden is not None:
                 return hidden
         # Eager fallback in small chunks to bound transient activation memory.
@@ -333,11 +399,16 @@ class _BucketedEncoder:
         return torch.cat(outs, dim=0)
 
     def _build_inputs(self, features, lengths, mask, length_arg, rung, chunk, padded):
-        batch = features.new_zeros((padded, rung, features.size(2)))
-        for row, index in enumerate(chunk):
-            batch[row, : lengths[index]] = features[index, : lengths[index]]
+        if self._axis == 2:
+            batch = features.new_zeros((padded, features.size(1), rung))
+            for row, index in enumerate(chunk):
+                batch[row, :, : lengths[index]] = features[index, :, : lengths[index]]
+        else:
+            batch = features.new_zeros((padded, rung, features.size(2)))
+            for row, index in enumerate(chunk):
+                batch[row, : lengths[index]] = features[index, : lengths[index]]
         if mask is not None:
-            return (batch, self._mask_for(mask, chunk, rung, features.size(1), padded))
+            return (batch, self._mask_for(mask, chunk, rung, self._time_dim(features), padded))
         if length_arg is not None:
             return (batch, self._lengths_for(length_arg, chunk, rung, padded))
         return (batch,)
@@ -370,11 +441,14 @@ class _BucketedEncoder:
             return
         try:
             device, dtype = features.device, features.dtype
-            n_mels = features.size(2)
-            total = features.size(1)
+            n_mels = features.size(1) if self._axis == 2 else features.size(2)
+            total = self._time_dim(features)
 
             def make_inputs(batch, rung):
-                x = torch.zeros((batch, rung, n_mels), device=device, dtype=dtype)
+                if self._axis == 2:
+                    x = torch.zeros((batch, n_mels, rung), device=device, dtype=dtype)
+                else:
+                    x = torch.zeros((batch, rung, n_mels), device=device, dtype=dtype)
                 if mask is not None:
                     width = max(1, rung * mask.size(1) // total)
                     return (x, torch.ones((batch, width), device=device, dtype=mask.dtype))
@@ -487,6 +561,11 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
         if not pattern.search(name):
             continue
         encoder = _BucketedEncoder(module, name, ladder)
+        for klass in type(module).__mro__:
+            shim = _FORWARD_SHIMS.get(klass.__name__)
+            if shim is not None:
+                encoder._original = (lambda s, m: lambda *a, **k: s(m, *a, **k))(shim, module)
+                break
         module.forward = encoder
         wrapped.append(name)
         encoders.append(encoder)

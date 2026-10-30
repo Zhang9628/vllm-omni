@@ -147,9 +147,9 @@ def test_real_installer_publishes_lengths_through_embed_multimodal(bucket_env):
     seen: list[tuple] = []
     original_execute = encoder_wrapper.pool.execute
 
-    def counting_execute(*args):
+    def counting_execute(*args, **kwargs):
         seen.append(tuple(args[0].shape))
-        return original_execute(*args)
+        return original_execute(*args, **kwargs)
 
     encoder_wrapper.pool.execute = counting_execute
     calls_before = len(model.encoder.calls)
@@ -267,3 +267,59 @@ def test_module_pattern_env_override(bucket_env, monkeypatch):
 
     model = CustomModel().cuda()
     assert install_bucketed_encoders(model) == ["my_frontend"]
+
+
+def test_fixed_window_encoder_contract_engages(bucket_env, monkeypatch):
+    """The tencent/Covo-Audio-Chat call contract (community model, added in
+    PR #2293): a single positional ``(B, mel, T)`` input to a fixed-window HF
+    WhisperEncoder, lengths published via embed_multimodal. The module's
+    time-axis handling and fixed-window recipe must engage the bucketed path
+    with zero model-side changes: fixed-window forward untouched, windows
+    captured per rung, and exact output where rung == true length."""
+    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "3,8,30")  # rungs 300/800/3000
+    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_BATCH_SIZES", "1,2,4")
+    from transformers.models.whisper.configuration_whisper import WhisperConfig
+    from transformers.models.whisper.modeling_whisper import WhisperEncoder
+
+    raw_calls = []
+    original_forward = WhisperEncoder.forward
+
+    def counting_forward(self, *args, **kwargs):
+        raw_calls.append(tuple(args[0].shape))
+        return original_forward(self, *args, **kwargs)
+
+    monkeypatch.setattr(WhisperEncoder, "forward", counting_forward)
+
+    class CovoContractModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            cfg = WhisperConfig(d_model=64, encoder_layers=1, encoder_attention_heads=2,
+                                encoder_ffn_dim=128, num_mel_bins=80, max_source_positions=1500)
+            self.encoder = WhisperEncoder(cfg).cuda().eval()
+
+        def embed_multimodal(self, **kwargs):  # covo_audio_llm.py:116 contract
+            return self.encoder(kwargs["audio_features"]).last_hidden_state
+
+    model = CovoContractModel()
+    assert install_bucketed_encoders(model) == ["encoder"]
+    wrapper = model.encoder.forward
+
+    lengths = [300, 800, 2400]
+    feats = torch.randn(len(lengths), 80, 3000, device="cuda")  # (B, mel, T) padded to 30s
+    with torch.inference_mode():
+        model.embed_multimodal(audio_features=feats, encoder_bucket_frames=torch.tensor(lengths))
+        assert wrapper._lengths == tuple(lengths)
+        out = model.encoder(feats)
+
+    # Engaged: per-rung windows were captured and replayed (fallback never
+    # captures a 300/800-frame window, and calls the fixed-window forward).
+    assert wrapper.pool is not None and wrapper.pool.entries
+    for key in ((1, 300), (1, 800), (1, 3000)):
+        assert key in wrapper.pool.entries, f"missing captured entry {key}"
+    assert raw_calls == [], f"fixed-window forward was called: {raw_calls}"
+
+    # Exact where the rung equals the true length (no padding involved).
+    hidden = out.last_hidden_state
+    assert hidden.shape[0] == len(lengths) and hidden.shape[2] == 64
+    solo_row0 = wrapper._original(feats[0:1, :, :300])
+    torch.testing.assert_close(hidden[0, :150], solo_row0.last_hidden_state[0], rtol=0, atol=1e-5)
