@@ -39,9 +39,10 @@ import pytest
 import torch
 from torch import nn
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.worker.bucketed_encoder import install_bucketed_encoders
 
-pytestmark = [pytest.mark.core_model]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 torch.manual_seed(0)
 
