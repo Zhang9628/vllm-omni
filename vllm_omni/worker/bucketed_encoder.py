@@ -319,9 +319,10 @@ class _BucketedEncoder:
 
         # Route empty batches and batches containing an item longer than the
         # largest rung through the untouched forward (cheap host-side checks).
-        # max(lengths) is only valid on a non-empty list, and _resolve_time_axis
-        # also calls max(lengths), so the empty case must be handled first.
-        if not lengths:
+        # max(lengths) is only valid on a non-empty sequence, and
+        # _resolve_time_axis also calls max(lengths), so the empty case must be
+        # handled first. len() == 0 also stays valid if lengths is ever a tensor.
+        if len(lengths) == 0:
             return self._original(*args, **kwargs)
 
         self._axis = self._resolve_time_axis(features, lengths)
