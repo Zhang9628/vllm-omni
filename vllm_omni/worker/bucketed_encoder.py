@@ -283,6 +283,13 @@ class _BucketedEncoder:
         spec = os.environ.get(_ENV_TIME_AXIS, "auto").strip().lower()
         if spec in ("1", "2"):
             return int(spec)
+        # The fixed-window Whisper recipe operates on the module's native
+        # channels-first (B, mel, T) layout by construction — mel bins on
+        # dim 1, padded time on dim 2 — regardless of how short the true
+        # lengths are (a 1s clip has fewer frames than mel bins, which would
+        # defeat the length-scale heuristic below).
+        if self._shim is not None:
+            return 2
         time_on_1, time_on_2 = features.size(1), features.size(2)
         longest = max(lengths)
         if longest > time_on_1 and time_on_2 >= longest:

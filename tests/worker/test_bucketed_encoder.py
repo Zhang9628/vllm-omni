@@ -405,3 +405,35 @@ def test_covo_processor_carries_bucket_frames():
 
     fields = proc._get_mm_fields_config(hf, {})
     assert "encoder_bucket_frames" in fields
+
+
+def test_whisper_shim_short_audio_uses_channels_first_axis(bucket_env):
+    """A short clip (100 frames < 128 mel bins) must still bucket along the
+    channels-first time axis — the Whisper recipe implies (B, mel, T) by
+    construction, so the length-scale heuristic must not flip the axis."""
+    from transformers.models.whisper.configuration_whisper import WhisperConfig
+    from transformers.models.whisper.modeling_whisper import WhisperEncoder
+
+    cfg = WhisperConfig(d_model=64, encoder_layers=1, encoder_attention_heads=2,
+                        encoder_ffn_dim=128, num_mel_bins=128, max_source_positions=1500)
+
+    class CovoLikeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = WhisperEncoder(cfg).cuda().eval()
+
+        def embed_multimodal(self, **kwargs):
+            return self.encoder(kwargs["audio_features"]).last_hidden_state
+
+    model = CovoLikeModel()
+    assert install_bucketed_encoders(model) == ["encoder"]
+    wrapper = model.encoder.forward
+
+    feats = torch.randn(1, 128, 3000, device="cuda")
+    with torch.inference_mode():
+        model.embed_multimodal(audio_features=feats, encoder_bucket_frames=torch.tensor([100]))
+        out = model.encoder(feats).last_hidden_state
+
+    # Bucketed: rung 100 -> 50 output frames; fallback would be 3000/2 = 1500.
+    assert out.shape == (1, 50, 64), out.shape
+    assert wrapper._disabled is False, "bucketed path fell back for a short clip"
