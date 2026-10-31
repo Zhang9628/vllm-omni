@@ -414,8 +414,14 @@ def test_whisper_shim_short_audio_uses_channels_first_axis(bucket_env):
     from transformers.models.whisper.configuration_whisper import WhisperConfig
     from transformers.models.whisper.modeling_whisper import WhisperEncoder
 
-    cfg = WhisperConfig(d_model=64, encoder_layers=1, encoder_attention_heads=2,
-                        encoder_ffn_dim=128, num_mel_bins=128, max_source_positions=1500)
+    cfg = WhisperConfig(
+        d_model=64,
+        encoder_layers=1,
+        encoder_attention_heads=2,
+        encoder_ffn_dim=128,
+        num_mel_bins=128,
+        max_source_positions=1500,
+    )
 
     class CovoLikeModel(nn.Module):
         def __init__(self):
