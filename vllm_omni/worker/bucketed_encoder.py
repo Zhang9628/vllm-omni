@@ -102,9 +102,12 @@ def _whisper_varlen_shim(module, input_features, *rest, **kwargs):
 
 
 # Class-name keyed to avoid importing model libraries at module import.
+# NOTE: Qwen2AudioEncoder is intentionally NOT here — its forward applies an
+# avg_pooler before layer normalization, so the Whisper recipe would produce
+# twice as many embeddings per clip. Fixed-window classes without a correct
+# recipe keep the original forward (which also serves the fallback path).
 _FORWARD_SHIMS = {
     "WhisperEncoder": _whisper_varlen_shim,
-    "Qwen2AudioEncoder": _whisper_varlen_shim,
 }
 
 
@@ -262,6 +265,7 @@ class _BucketedEncoder:
         self.name = name
         self.ladder = ladder
         self._original = module.forward
+        self._shim = None  # optional fixed-window recipe; used ONLY for bucketed windows
         self.pool: BucketedGraphPool | None = None
         self._pool_failed = False
         self._rebuild = None
@@ -431,7 +435,11 @@ class _BucketedEncoder:
         return [list(items[i : i + size]) for i in range(0, len(items), size)]
 
     def _tensor_forward(self, *inputs):
-        tensor = _as_tensor(self._original(*inputs))
+        # The fixed-window recipe, if any, applies only to the bucketed-window
+        # compute. Ineligible calls (kwargs/2-D/non-CUDA/grad/stream-capturing)
+        # and the eager prime call still go through the untouched forward.
+        target = self._shim if self._shim is not None else self._original
+        tensor = _as_tensor(target(*inputs))
         if tensor is None:
             raise TypeError(f"encoder {self.name!r} returned an unsupported output type")
         return tensor
@@ -564,7 +572,9 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
         for klass in type(module).__mro__:
             shim = _FORWARD_SHIMS.get(klass.__name__)
             if shim is not None:
-                encoder._original = (lambda s, m: lambda *a, **k: s(m, *a, **k))(shim, module)
+                # Keep _original as the untouched forward (fallback + prime);
+                # the shim is only used for bucketed windows via _tensor_forward.
+                encoder._shim = (lambda s, m: lambda *a, **k: s(m, *a, **k))(shim, module)
                 break
         module.forward = encoder
         wrapped.append(name)

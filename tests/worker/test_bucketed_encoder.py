@@ -323,10 +323,85 @@ def test_fixed_window_encoder_contract_engages(bucket_env, monkeypatch):
     assert wrapper.pool is not None and wrapper.pool.entries
     for key in ((1, 300), (1, 800), (1, 3000)):
         assert key in wrapper.pool.entries, f"missing captured entry {key}"
-    assert raw_calls == [], f"fixed-window forward was called: {raw_calls}"
+    # The untouched forward may run once at the eager prime (full 3000-frame
+    # input); the bucketed rung windows must never hit it (they use the shim).
+    assert raw_calls == [(3, 80, 3000)], f"fixed-window forward calls: {raw_calls}"
 
     # Exact where the rung equals the true length (no padding involved).
     hidden = out.last_hidden_state
     assert hidden.shape[0] == len(lengths) and hidden.shape[2] == 64
-    solo_row0 = wrapper._original(feats[0:1, :, :300])
+    solo_row0 = wrapper._shim(feats[0:1, :, :300])
     torch.testing.assert_close(hidden[0, :150], solo_row0.last_hidden_state[0], rtol=0, atol=1e-5)
+
+
+def test_qwen2audio_keyword_call_keeps_pooling_and_true_fallback(bucket_env):
+    """P1: Qwen2AudioEncoder must NOT carry the Whisper recipe, so an installed
+    module's keyword-argument call (Audex contract) runs the untouched forward:
+    pooling preserved (750 emb per 3000-frame clip, not 1500) and feature-off
+    parity against a pristine encoder, not the replaced _original."""
+    from transformers.models.qwen2_audio.configuration_qwen2_audio import Qwen2AudioEncoderConfig
+    from transformers.models.qwen2_audio.modeling_qwen2_audio import Qwen2AudioEncoder
+
+    cfg = Qwen2AudioEncoderConfig(
+        d_model=64,
+        encoder_layers=1,
+        encoder_attention_heads=2,
+        encoder_ffn_dim=128,
+        num_mel_bins=80,
+        max_source_positions=1500,
+    )
+
+    class AudexModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.audio_tower = Qwen2AudioEncoder(cfg).cuda().eval()
+
+    model = AudexModel()
+    assert install_bucketed_encoders(model) == ["audio_tower"]
+    wrapper = model.audio_tower.forward
+    assert wrapper._shim is None, "Qwen2AudioEncoder must not carry the Whisper recipe"
+
+    pristine = Qwen2AudioEncoder(cfg).cuda().eval()
+    pristine.load_state_dict(model.audio_tower.state_dict())
+
+    feats = torch.randn(1, 80, 3000, device="cuda")
+    with torch.inference_mode():
+        out = model.audio_tower(input_features=feats, return_dict=True).last_hidden_state
+        ref = pristine(input_features=feats, return_dict=True).last_hidden_state
+
+    assert out.shape == (1, 750, 64), out.shape  # avg_pooler applied: 3000 -> 750
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+def test_covo_processor_carries_bucket_frames():
+    """P2: the concrete CovoAudio processor emits encoder_bucket_frames (from
+    raw audio sample counts) and registers it, so lengths survive the
+    raw-audio -> concrete-processor boundary."""
+    import numpy as np
+
+    from vllm_omni.model_executor.models.covo_audio.covo_audio import CovoAudioMultiModalProcessor
+
+    class _Tok:
+        def encode(self, s):
+            return [1, 2, 3]
+
+    class _FeatExt:
+        def __call__(self, raw_audios, sampling_rate, return_tensors):
+            return {"input_features": torch.zeros(len(raw_audios), 128, 3000)}
+
+    class _Info:
+        def get_tokenizer(self):
+            return _Tok()
+
+        def get_feature_extractor(self):
+            return _FeatExt()
+
+    proc = CovoAudioMultiModalProcessor.__new__(CovoAudioMultiModalProcessor)
+    proc.info = _Info()
+    proc.dummy_inputs = None
+
+    hf = proc._call_hf_processor("hi", {"audios": [(np.zeros(16000 * 3, dtype=np.float32), 16000)]}, {}, {})
+    assert torch.equal(hf["encoder_bucket_frames"], torch.tensor([300], dtype=torch.int64)), hf["encoder_bucket_frames"]
+
+    fields = proc._get_mm_fields_config(hf, {})
+    assert "encoder_bucket_frames" in fields
