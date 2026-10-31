@@ -443,3 +443,35 @@ def test_whisper_shim_short_audio_uses_channels_first_axis(bucket_env):
     # Bucketed: rung 100 -> 50 output frames; fallback would be 3000/2 = 1500.
     assert out.shape == (1, 50, 64), out.shape
     assert wrapper._disabled is False, "bucketed path fell back for a short clip"
+
+
+def test_overlong_item_truncates_without_disabling(bucket_env):
+    """An item longer than the largest rung must be truncated, not raise and
+    permanently disable the wrapper for all later requests."""
+    model = ToyModel().cuda()
+    assert install_bucketed_encoders(model) == ["encoder"]
+    wrapper = model.encoder.forward
+
+    lengths = [240, 100]  # 240 > largest rung 200
+    feats = torch.randn(2, 240, D, device="cuda")
+    with torch.inference_mode():
+        model.embed_multimodal(audio_features=feats, encoder_bucket_frames=torch.tensor(lengths))
+        out = model.encoder(feats).last_hidden_state
+
+    assert wrapper._disabled is False, "over-long item must not disable the wrapper"
+    assert out.shape == (2, 200, D), out.shape  # clamped to the largest rung
+
+
+def test_stale_lengths_are_cleared(bucket_env):
+    """A later embed_multimodal call without the length field must clear stale
+    lengths instead of reusing the previous request's."""
+    model = ToyModel().cuda()
+    install_bucketed_encoders(model)
+    wrapper = model.encoder.forward
+
+    feats = make_features()
+    with torch.inference_mode():
+        model.embed_multimodal(audio_features=feats, encoder_bucket_frames=torch.tensor(LENGTHS))
+        assert wrapper._lengths == tuple(LENGTHS)
+        model.embed_multimodal(audio_features=feats)  # no length field
+        assert wrapper._lengths is None

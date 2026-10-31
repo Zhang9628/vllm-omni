@@ -269,12 +269,11 @@ class _BucketedEncoder:
         self.pool: BucketedGraphPool | None = None
         self._pool_failed = False
         self._rebuild = None
-        self._ratio: float | None = None
         self._lengths: tuple[int, ...] | None = None
         self._disabled = False
         self._axis = 1  # feature-time axis; 2 for (B, mel, T) layouts
 
-    def publish(self, lengths: tuple[int, ...]) -> None:
+    def publish(self, lengths: tuple[int, ...] | None) -> None:
         self._lengths = lengths
 
     def _resolve_time_axis(self, features, lengths) -> int:
@@ -335,7 +334,6 @@ class _BucketedEncoder:
                     )
                     return output
                 self._rebuild = split[1]
-                self._ratio = split[0].size(1) / self._time_dim(features)
                 self._capture(features, mask, length_arg)
                 return output
             container = self._bucketed(features, lengths, mask, length_arg)
@@ -413,11 +411,13 @@ class _BucketedEncoder:
         if self._axis == 2:
             batch = features.new_zeros((padded, features.size(1), rung))
             for row, index in enumerate(chunk):
-                batch[row, :, : lengths[index]] = features[index, :, : lengths[index]]
+                take = min(lengths[index], rung)
+                batch[row, :, :take] = features[index, :, :take]
         else:
             batch = features.new_zeros((padded, rung, features.size(2)))
             for row, index in enumerate(chunk):
-                batch[row, : lengths[index]] = features[index, : lengths[index]]
+                take = min(lengths[index], rung)
+                batch[row, :take] = features[index, :take]
         if mask is not None:
             return (batch, self._mask_for(mask, chunk, rung, self._time_dim(features), padded))
         if length_arg is not None:
@@ -550,10 +550,11 @@ def _wrap_embed_multimodal(model: nn.Module, encoders: Sequence[_BucketedEncoder
 
     def embed_multimodal(**kwargs):
         frames = kwargs.get(_BUCKET_FRAMES_KEY)
-        if frames is not None and hasattr(frames, "tolist"):
-            lengths = tuple(int(v) for v in frames.tolist())
-            for encoder in encoders:
-                encoder.publish(lengths)
+        lengths = tuple(int(v) for v in frames.tolist()) if frames is not None and hasattr(frames, "tolist") else None
+        # Always publish, so a request without the field clears any stale
+        # lengths left over from a previous request of the same batch size.
+        for encoder in encoders:
+            encoder.publish(lengths)
         return original(**kwargs)
 
     model.embed_multimodal = embed_multimodal
@@ -573,6 +574,8 @@ def install_bucketed_encoders(model: nn.Module, *, vllm_config=None) -> list[str
     wrapped: list[str] = []
     encoders: list[_BucketedEncoder] = []
     for name, module in model.named_modules():
+        if any(name == p or name.startswith(p + ".") for p in wrapped):
+            continue  # skip descendants of an already-wrapped module
         if not pattern.search(name):
             continue
         encoder = _BucketedEncoder(module, name, ladder)
