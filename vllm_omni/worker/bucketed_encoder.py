@@ -271,6 +271,7 @@ class _BucketedEncoder:
         self._rebuild = None
         self._lengths: tuple[int, ...] | None = None
         self._disabled = False
+        self._truncation_warned = False
         self._axis = 1  # feature-time axis; 2 for (B, mel, T) layouts
 
     def publish(self, lengths: tuple[int, ...] | None) -> None:
@@ -317,6 +318,13 @@ class _BucketedEncoder:
             return self._original(*args, **kwargs)
 
         self._axis = self._resolve_time_axis(features, lengths)
+
+        # An item longer than the largest rung cannot be bucketed without
+        # truncating its tail, which would silently change that item's output
+        # length downstream. Route such batches through the untouched forward
+        # (cheap host-side check — lengths are already on the host).
+        if max(lengths) > self.ladder.max_length:
+            return self._original(*args, **kwargs)
 
         try:
             if self._rebuild is None:
@@ -408,6 +416,14 @@ class _BucketedEncoder:
         return torch.cat(outs, dim=0)
 
     def _build_inputs(self, features, lengths, mask, length_arg, rung, chunk, padded):
+        if any(lengths[index] > rung for index in chunk) and not self._truncation_warned:
+            self._truncation_warned = True
+            logger.warning(
+                "Bucketed encoder %r truncated an item longer than rung %d; "
+                "such batches should have been routed to the original forward",
+                self.name,
+                rung,
+            )
         if self._axis == 2:
             batch = features.new_zeros((padded, features.size(1), rung))
             for row, index in enumerate(chunk):
@@ -434,7 +450,7 @@ class _BucketedEncoder:
     @staticmethod
     def _lengths_for(length_arg, chunk, rung, padded):
         out = torch.full((padded,), rung, dtype=length_arg.dtype, device=length_arg.device)
-        out[: len(chunk)] = length_arg[chunk]
+        out[: len(chunk)] = length_arg[chunk].clamp(max=rung)
         return out
 
     @staticmethod

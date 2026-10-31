@@ -445,9 +445,10 @@ def test_whisper_shim_short_audio_uses_channels_first_axis(bucket_env):
     assert wrapper._disabled is False, "bucketed path fell back for a short clip"
 
 
-def test_overlong_item_truncates_without_disabling(bucket_env):
-    """An item longer than the largest rung must be truncated, not raise and
-    permanently disable the wrapper for all later requests."""
+def test_overlong_batch_falls_back_to_original(bucket_env):
+    """A batch whose max length exceeds the largest rung is routed through the
+    original forward — not truncated (which would silently change the item's
+    output length) and not permanently disabled."""
     model = ToyModel().cuda()
     assert install_bucketed_encoders(model) == ["encoder"]
     wrapper = model.encoder.forward
@@ -458,8 +459,18 @@ def test_overlong_item_truncates_without_disabling(bucket_env):
         model.embed_multimodal(audio_features=feats, encoder_bucket_frames=torch.tensor(lengths))
         out = model.encoder(feats).last_hidden_state
 
-    assert wrapper._disabled is False, "over-long item must not disable the wrapper"
-    assert out.shape == (2, 200, D), out.shape  # clamped to the largest rung
+    assert wrapper._disabled is False, "over-long batch must not disable the wrapper"
+    assert out.shape == (2, 240, D), out.shape  # full width = untouched forward
+
+
+def test_positional_lengths_clamp_to_rung(bucket_env):
+    """The positional CPU-lengths path must never tell the encoder a window is
+    longer than its rung (an un-clamped copy would index past the window)."""
+    model = ToyModel().cuda()
+    install_bucketed_encoders(model)
+    wrapper = model.encoder.forward
+    out = wrapper._lengths_for(torch.tensor([240, 100]), [0, 1], 200, 2)
+    assert torch.equal(out, torch.tensor([200, 100]))
 
 
 def test_stale_lengths_are_cleared(bucket_env):
