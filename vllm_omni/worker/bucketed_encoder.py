@@ -317,12 +317,17 @@ class _BucketedEncoder:
         if lengths is None or len(lengths) != features.size(0):
             return self._original(*args, **kwargs)
 
+        # Route empty batches and batches containing an item longer than the
+        # largest rung through the untouched forward (cheap host-side checks).
+        # max(lengths) is only valid on a non-empty list, and _resolve_time_axis
+        # also calls max(lengths), so the empty case must be handled first.
+        if not lengths:
+            return self._original(*args, **kwargs)
+
         self._axis = self._resolve_time_axis(features, lengths)
 
-        # An item longer than the largest rung cannot be bucketed without
-        # truncating its tail, which would silently change that item's output
-        # length downstream. Route such batches through the untouched forward
-        # (cheap host-side check — lengths are already on the host).
+        # An over-long item cannot be bucketed without truncating its tail,
+        # which would silently change that item's output length downstream.
         if max(lengths) > self.ladder.max_length:
             return self._original(*args, **kwargs)
 

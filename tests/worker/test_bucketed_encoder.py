@@ -486,3 +486,19 @@ def test_stale_lengths_are_cleared(bucket_env):
         assert wrapper._lengths == tuple(LENGTHS)
         model.embed_multimodal(audio_features=feats)  # no length field
         assert wrapper._lengths is None
+
+
+def test_empty_batch_falls_back_to_original(bucket_env):
+    """An empty batch must fall back to the original forward instead of raising
+    inside max(lengths)."""
+    model = ToyModel().cuda()
+    assert install_bucketed_encoders(model) == ["encoder"]
+    wrapper = model.encoder.forward
+
+    feats = torch.empty(0, 240, D, device="cuda")
+    with torch.inference_mode():
+        model.embed_multimodal(audio_features=feats, encoder_bucket_frames=torch.empty(0, dtype=torch.int64))
+        out = model.encoder(feats).last_hidden_state
+
+    assert wrapper._disabled is False
+    assert out.shape == (0, 240, D), out.shape
